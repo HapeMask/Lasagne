@@ -1,4 +1,5 @@
 import theano.tensor as T
+from theano.tensor.nnet.abstract_conv import get_conv_shape_1axis
 
 from .. import init
 from .. import nonlinearities
@@ -18,74 +19,6 @@ __all__ = [
     "TransposedConv3DLayer",
     "Deconv3DLayer",
 ]
-
-
-def conv_output_length(input_length, filter_size, stride, pad=0):
-    """Helper function to compute the output size of a convolution operation
-
-    This function computes the length along a single axis, which corresponds
-    to a 1D convolution. It can also be used for convolutions with higher
-    dimensionalities by using it individually for each axis.
-
-    Parameters
-    ----------
-    input_length : int or None
-        The size of the input.
-
-    filter_size : int
-        The size of the filter.
-
-    stride : int
-        The stride of the convolution operation.
-
-    pad : int, 'full' or 'same' (default: 0)
-        By default, the convolution is only computed where the input and the
-        filter fully overlap (a valid convolution). When ``stride=1``, this
-        yields an output that is smaller than the input by ``filter_size - 1``.
-        The `pad` argument allows you to implicitly pad the input with zeros,
-        extending the output size.
-
-        A single integer results in symmetric zero-padding of the given size on
-        both borders.
-
-        ``'full'`` pads with one less than the filter size on both sides. This
-        is equivalent to computing the convolution wherever the input and the
-        filter overlap by at least one position.
-
-        ``'same'`` pads with half the filter size on both sides (one less on
-        the second side for an even filter size). When ``stride=1``, this
-        results in an output size equal to the input size.
-
-    Returns
-    -------
-    int or None
-        The output size corresponding to the given convolution parameters, or
-        ``None`` if `input_size` is ``None``.
-
-    Raises
-    ------
-    ValueError
-        When an invalid padding is specified, a `ValueError` is raised.
-    """
-    if input_length is None:
-        return None
-    if pad == 'valid':
-        output_length = input_length - filter_size + 1
-    elif pad == 'full':
-        output_length = input_length + filter_size - 1
-    elif pad == 'same':
-        output_length = input_length
-    elif isinstance(pad, int):
-        output_length = input_length + 2 * pad - filter_size + 1
-    else:
-        raise ValueError('Invalid pad: {0}'.format(pad))
-
-    # This is the integer arithmetic equivalent to
-    # np.ceil(output_length / stride)
-    output_length = (output_length + stride - 1) // stride
-
-    return output_length
-
 
 def conv_input_length(output_length, filter_size, stride, pad=0):
     """Helper function to compute the input size of a convolution operation
@@ -262,8 +195,8 @@ class BaseConvLayer(Layer):
     b : Theano shared variable or expression
         Variable or expression representing the biases.
     """
-    def __init__(self, incoming, num_filters, filter_size, stride=1, pad=0,
-                 untie_biases=False,
+    def __init__(self, incoming, num_filters, filter_size, stride=1,
+                 filter_dilation=1, pad=0, untie_biases=False,
                  W=init.GlorotUniform(), b=init.Constant(0.),
                  nonlinearity=nonlinearities.rectify, flip_filters=True,
                  n=None, **kwargs):
@@ -285,6 +218,7 @@ class BaseConvLayer(Layer):
         self.filter_size = as_tuple(filter_size, n, int)
         self.flip_filters = flip_filters
         self.stride = as_tuple(stride, n, int)
+        self.filter_dilation = as_tuple(filter_dilation, n, int)
         self.untie_biases = untie_biases
 
         if pad == 'same':
@@ -321,13 +255,13 @@ class BaseConvLayer(Layer):
         return (self.num_filters, num_input_channels) + self.filter_size
 
     def get_output_shape_for(self, input_shape):
-        pad = self.pad if isinstance(self.pad, tuple) else (self.pad,) * self.n
-        batchsize = input_shape[0]
-        return ((batchsize, self.num_filters) +
-                tuple(conv_output_length(input, filter, stride, p)
-                      for input, filter, stride, p
+        bm = 'half' if self.pad == 'same' else self.pad
+        border_mode = bm if isinstance(bm, tuple) else (bm,) * self.n
+        return ((input_shape[0], self.num_filters) +
+                tuple(get_conv_shape_1axis(ishp, fshp, bm, sub, dil)
+                      for ishp, fshp, bm, sub, dil
                       in zip(input_shape[2:], self.filter_size,
-                             self.stride, pad)))
+                          border_mode, self.stride, self.filter_dilation)))
 
     def get_output_for(self, input, **kwargs):
         conved = self.convolve(input, **kwargs)
@@ -393,6 +327,11 @@ class Conv1DLayer(BaseConvLayer):
     stride : int or iterable of int
         An integer or a 1-element tuple specifying the stride of the
         convolution operation.
+
+    filter_dilation : int or iterable of int
+        An integer or a 1-element tuple specifying the dilation factor of the
+        filters. A factor of :math:`x` corresponds to :math:`x - 1` zeros
+        inserted between adjacent filter elements.
 
     pad : int, iterable of int, 'full', 'same' or 'valid' (default: 0)
         By default, the convolution is only computed where the input and the
@@ -468,14 +407,14 @@ class Conv1DLayer(BaseConvLayer):
         Variable or expression representing the biases.
     """
     def __init__(self, incoming, num_filters, filter_size, stride=1,
-                 pad=0, untie_biases=False,
+                 filter_dilation=1, pad=0, untie_biases=False,
                  W=init.GlorotUniform(), b=init.Constant(0.),
                  nonlinearity=nonlinearities.rectify, flip_filters=True,
                  convolution=conv.conv1d_mc0, **kwargs):
         super(Conv1DLayer, self).__init__(incoming, num_filters, filter_size,
-                                          stride, pad, untie_biases, W, b,
-                                          nonlinearity, flip_filters, n=1,
-                                          **kwargs)
+                                          stride, filter_dilation, pad,
+                                          untie_biases, W, b, nonlinearity,
+                                          flip_filters, n=1, **kwargs)
         self.convolution = convolution
 
     def convolve(self, input, **kwargs):
@@ -483,6 +422,7 @@ class Conv1DLayer(BaseConvLayer):
         conved = self.convolution(input, self.W,
                                   self.input_shape, self.get_W_shape(),
                                   subsample=self.stride,
+                                  filter_dilation=self.filter_dilation,
                                   border_mode=border_mode,
                                   filter_flip=self.flip_filters)
         return conved
@@ -517,6 +457,11 @@ class Conv2DLayer(BaseConvLayer):
     stride : int or iterable of int
         An integer or a 2-element tuple specifying the stride of the
         convolution operation.
+
+    filter_dilation : int or iterable of int
+        An integer or a 2-element tuple specifying the dilation factor of the
+        filters. A factor of :math:`x` corresponds to :math:`x - 1` zeros
+        inserted between adjacent filter elements.
 
     pad : int, iterable of int, 'full', 'same' or 'valid' (default: 0)
         By default, the convolution is only computed where the input and the
@@ -592,14 +537,14 @@ class Conv2DLayer(BaseConvLayer):
         Variable or expression representing the biases.
     """
     def __init__(self, incoming, num_filters, filter_size, stride=(1, 1),
-                 pad=0, untie_biases=False,
+                 filter_dilation=(1, 1), pad=0, untie_biases=False,
                  W=init.GlorotUniform(), b=init.Constant(0.),
                  nonlinearity=nonlinearities.rectify, flip_filters=True,
                  convolution=T.nnet.conv2d, **kwargs):
         super(Conv2DLayer, self).__init__(incoming, num_filters, filter_size,
-                                          stride, pad, untie_biases, W, b,
-                                          nonlinearity, flip_filters, n=2,
-                                          **kwargs)
+                                          stride, filter_dilation, pad,
+                                          untie_biases, W, b, nonlinearity,
+                                          flip_filters, n=2, **kwargs)
         self.convolution = convolution
 
     def convolve(self, input, **kwargs):
@@ -607,6 +552,7 @@ class Conv2DLayer(BaseConvLayer):
         conved = self.convolution(input, self.W,
                                   self.input_shape, self.get_W_shape(),
                                   subsample=self.stride,
+                                  filter_dilation=self.filter_dilation,
                                   border_mode=border_mode,
                                   filter_flip=self.flip_filters)
         return conved
@@ -640,6 +586,11 @@ class Conv3DLayer(BaseConvLayer):  # pragma: no cover
     stride : int or iterable of int
         An integer or a 3-element tuple specifying the stride of the
         convolution operation.
+
+    filter_dilation : int or iterable of int
+        An integer or a 3-element tuple specifying the dilation factor of the
+        filters. A factor of :math:`x` corresponds to :math:`x - 1` zeros
+        inserted between adjacent filter elements.
 
     pad : int, iterable of int, 'full', 'same' or 'valid' (default: 0)
         By default, the convolution is only computed where the input and the
@@ -715,23 +666,30 @@ class Conv3DLayer(BaseConvLayer):  # pragma: no cover
         Variable or expression representing the biases.
     """
     def __init__(self, incoming, num_filters, filter_size, stride=(1, 1, 1),
-                 pad=0, untie_biases=False,
+                 filter_dilation=(1, 1, 1), pad=0, untie_biases=False,
                  W=init.GlorotUniform(), b=init.Constant(0.),
                  nonlinearity=nonlinearities.rectify, flip_filters=True,
                  convolution=None, **kwargs):
         super(Conv3DLayer, self).__init__(incoming, num_filters, filter_size,
-                                          stride, pad, untie_biases, W, b,
-                                          nonlinearity, flip_filters, n=3,
-                                          **kwargs)
+                                          stride, filter_dilation, pad,
+                                          untie_biases, W, b, nonlinearity,
+                                          flip_filters, n=3, **kwargs)
         if convolution is None:
             convolution = T.nnet.conv3d
         self.convolution = convolution
+
+    def get_output_shape_for(self, input_shape):
+        bm = 'half' if self.pad == 'same' else self.pad
+        return get_conv_output_shape(input_shape, self.get_W_shape(),
+                                     border_mode=bm, subsample=self.stride,
+                                     filter_dilation=self.filter_dilation)
 
     def convolve(self, input, **kwargs):
         border_mode = 'half' if self.pad == 'same' else self.pad
         conved = self.convolution(input, self.W,
                                   self.input_shape, self.get_W_shape(),
                                   subsample=self.stride,
+                                  filter_dilation=self.filter_dilation,
                                   border_mode=border_mode,
                                   filter_flip=self.flip_filters)
         return conved
@@ -888,7 +846,7 @@ class TransposedConv2DLayer(BaseConvLayer):
             output_size = as_tuple(output_size, 2, int)
         self.output_size = output_size
         super(TransposedConv2DLayer, self).__init__(
-                incoming, num_filters, filter_size, stride, crop, untie_biases,
+                incoming, num_filters, filter_size, stride, 1, crop, untie_biases,
                 W, b, nonlinearity, flip_filters, n=2, **kwargs)
         # rename self.pad to self.crop:
         self.crop = self.pad
@@ -1237,9 +1195,8 @@ class DilatedConv2DLayer(BaseConvLayer):
                  W=init.GlorotUniform(), b=init.Constant(0.),
                  nonlinearity=nonlinearities.rectify, flip_filters=False,
                  **kwargs):
-        self.dilation = as_tuple(dilation, 2, int)
         super(DilatedConv2DLayer, self).__init__(
-                incoming, num_filters, filter_size, 1, pad,
+                incoming, num_filters, filter_size, 1, dilation, pad,
                 untie_biases, W, b, nonlinearity, flip_filters, n=2, **kwargs)
         # remove self.stride:
         del self.stride
@@ -1260,12 +1217,13 @@ class DilatedConv2DLayer(BaseConvLayer):
         return (num_input_channels, self.num_filters) + self.filter_size
 
     def get_output_shape_for(self, input_shape):
-        batchsize = input_shape[0]
-        return ((batchsize, self.num_filters) +
-                tuple(conv_output_length(input, (filter-1) * dilate + 1, 1, 0)
-                      for input, filter, dilate
+        bm = 'half' if self.pad == 'same' else self.pad
+        border_mode = bm if isinstance(bm, tuple) else (bm,) * self.n
+        return ((input_shape[0], self.num_filters) +
+                tuple(get_conv_shape_1axis(ishp, fshp, bm, 1, dil)
+                      for ishp, fshp, bm, dil
                       in zip(input_shape[2:], self.filter_size,
-                             self.dilation)))
+                          border_mode, self.filter_dilation)))
 
     def convolve(self, input, **kwargs):
         # we perform a convolution backward pass wrt weights,
@@ -1277,7 +1235,7 @@ class DilatedConv2DLayer(BaseConvLayer):
         kshp = (kshp[1], kshp[0]) + kshp[2:]
         op = T.nnet.abstract_conv.AbstractConv2d_gradWeights(
             imshp=imshp, kshp=kshp,
-            subsample=self.dilation, border_mode='valid',
+            subsample=self.filter_dilation, border_mode='valid',
             filter_flip=False)
         output_size = self.output_shape[2:]
         if any(s is None for s in output_size):

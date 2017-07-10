@@ -6,7 +6,7 @@ from .. import init
 from .. import nonlinearities
 from .base import Layer
 
-from .conv import conv_output_length, BaseConvLayer
+from .conv import BaseConvLayer
 from .pool import pool_output_length
 from .normalization import BatchNormLayer
 from ..utils import as_tuple
